@@ -1,0 +1,176 @@
+WebApp Hygiene & Compliance Requirements Prompt
+Core Authentication & User Management
+Sign-Up Flow
+•	Email/Phone validation with verification codes
+•	Password strength requirements (minimum 8 chars, mixed case, numbers, symbols)
+•	Terms acceptance checkbox (required, cannot proceed without)
+•	Privacy policy acknowledgment (required, cannot proceed without)
+•	Duplicate account prevention (email/phone already exists handling)
+•	Account activation flow via email/SMS verification
+•	Onboarding completion tracking (profile setup, tutorial completion)
+Sign-In Flow
+•	Multi-factor authentication (MFA) option/requirement for sensitive accounts
+•	"Remember me" functionality with secure session management
+•	Forgot password flow with secure reset links (time-limited, single-use)
+•	Account lockout protection after failed attempts with progressive delays
+Account Management
+•	Profile editing with real-time validation
+•	Password change with current password verification
+•	Email/phone change with verification of new contact method
+•	Session management (view active sessions, remote logout)
+Account Deletion
+•	Account deletion request with confirmation steps
+•	Data retention explanation (what gets deleted vs. anonymized)
+•	Export data option before deletion
+Legal & Compliance Pages
+Privacy Policy (I have a privacy policy which I want to upload in the webapp)
+•	Data collection explanation (what, why, how)
+•	Data usage and processing purposes
+•	User rights (access, rectification, erasure, portability)
+•	Data retention periods and deletion policies
+•	International data transfers and safeguards
+•	Policy update notification process
+Terms of Service/Usage (I have a terms of service which I want to upload in the webapp)
+•	Service description and scope
+•	User responsibilities and acceptable use
+•	Prohibited activities and content restrictions
+•	Intellectual property rights (yours and users')
+•	Service availability and maintenance disclaimers
+•	Limitation of liability and disclaimers
+•	Termination conditions (user and platform initiated)
+•	Dispute resolution and governing law
+•	Modification notification process
+•	Contact information for legal matters
+Cookie Policy (GDPR Requirement)
+•	Cookie types explanation (essential, functional, analytics, marketing)
+•	Cookie consent management with granular controls
+•	Third-party cookies disclosure (Google Analytics, marketing pixels)
+•	Cookie duration and deletion information
+•	Browser cookie management instructions
+•	Consent withdrawal process
+Security & Technical Hygiene
+Security Headers & Configuration
+•	HTTPS enforcement (SSL/TLS certificates)
+•	Content Security Policy (CSP) headers
+•	HSTS (HTTP Strict Transport Security) implementation
+•	Rate limiting on APIs and forms
+•	Input validation and sanitization
+•	SQL injection prevention
+•	XSS protection measures
+Error Handling & User Experience
+•	Custom error pages (404, 500, maintenance)
+•	Graceful error messages (user-friendly, not technical)
+•	Network connectivity handling (offline states)
+•	Loading states and progress indicators
+•	Form validation (real-time and on submit)
+•	Success confirmations for user actions
+•	Undo functionality for destructive actions
+Accessibility & Usability
+Accessibility Compliance (WCAG 2.1 AA)
+•	Keyboard navigation support
+•	Screen reader compatibility (ARIA labels, semantic HTML)
+•	Color contrast compliance (4.5:1 ratio minimum)
+•	Alt text for images and media
+•	Focus indicators for interactive elements
+•	Text scaling support (up to 200%)
+•	Motion preference respect (reduced motion)
+Mobile & Responsive Design
+•	Mobile-first responsive design
+•	Touch-friendly interface (44px minimum touch targets)
+•	Viewport meta tag configuration
+•	App-like experience (PWA considerations)
+•	Offline functionality where applicable
+Communication & Notifications
+Email Communication System
+•	Transactional emails (welcome, verification, receipts)
+•	Notification preferences management
+•	Email unsubscribe mechanism (one-click)
+•	Email deliverability optimization
+•	Bounce and complaint handling
+In-App Notifications
+•	Notification permission request flow
+•	Notification types and frequency controls
+•	Push notification opt-out mechanism
+•	Email vs. push notification preferences
+Customer Support
+•	Contact methods (email)
+•	Feedback collection mechanism
+Performance & Monitoring
+Performance Optimization
+•	Page load speed optimization (< 3 seconds)
+•	Image optimization and lazy loading
+•	CDN implementation for static assets
+•	Database query optimization
+•	Caching strategies implementation
+Analytics & Monitoring
+•	User analytics (with privacy compliance)
+•	Error tracking and reporting
+•	Performance monitoring (uptime, response times)
+•	User feedback collection tools
+•	A/B testing infrastructure
+Business & Financial Hygiene
+Subscription & Billing (if applicable)
+•	Transparent pricing display
+•	Billing cycle clear explanation
+•	Payment method management
+•	Invoice generation and history
+•	Refund policy and process
+•	Subscription cancellation flow
+•	Dunning management for failed payments
+Internationalization (if global)
+•	Multi-language support
+•	Currency localization
+•	Date/time format localization
+•	Legal compliance per jurisdiction
+•	Tax calculation and collection
+Content & Community (if applicable)
+Content Management
+•	Content moderation policies and tools
+•	User-generated content guidelines
+•	Copyright infringement reporting (DMCA)
+•	Spam prevention mechanisms
+Community Guidelines
+•	Code of conduct for user interactions
+•	Reporting mechanisms for violations
+•	Appeal process for moderation decisions
+Implementation Checklist Template
+## Pre-Launch Hygiene Checklist
+
+### Authentication ✓
+- [ ] Sign-up flow with email verification
+- [ ] Sign-in with password reset
+- [ ] Account deletion with data export
+
+### Legal Compliance ✓
+- [ ] Privacy Policy (GDPR/CCPA compliant)
+- [ ] Terms of Service
+
+### Security ✓
+- [ ] HTTPS enforcement
+- [ ] Security headers implemented
+- [ ] Rate limiting on forms/APIs
+- [ ] Input validation and sanitization
+
+### Accessibility ✓
+- [ ] WCAG 2.1 AA compliance testing
+- [ ] Keyboard navigation
+- [ ] Screen reader testing
+- [ ] Color contrast validation
+
+### Performance ✓
+- [ ] Page load speed < 3 seconds
+- [ ] Mobile responsiveness
+- [ ] Error page handling
+- [ ] Offline state management
+
+### Support ✓
+- [ ] FAQ/Help section
+- [ ] Contact/Support system
+- [ ] Email notification system
+- [ ] User preference management
+
+### Monitoring ✓
+- [ ] Analytics implementation
+- [ ] Error tracking
+- [ ] Performance monitoring
+- [ ] User feedback collection

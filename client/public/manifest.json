@@ -1,0 +1,53 @@
+{
+  "name": "HiPo AI Coach - Professional Coaching for Indian Professionals",
+  "short_name": "HiPo Coach",
+  "description": "Get 6+ expert coaches in your pocket. Personalized career guidance for Indian professionals navigating workplace politics, career growth, and work-life balance.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#4C62E3",
+  "orientation": "portrait-primary",
+  "categories": ["business", "productivity", "education"],
+  "lang": "en",
+  "dir": "ltr",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/hipo-logo.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/hipo-logo-full.png", 
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Start New Chat",
+      "short_name": "New Chat",
+      "description": "Begin coaching session with AI coach",
+      "url": "/chat",
+      "icons": [{ "src": "/hipo-logo.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Select Coach",
+      "short_name": "Coaches",
+      "description": "Browse available coaching expertise",
+      "url": "/coaches", 
+      "icons": [{ "src": "/hipo-logo.png", "sizes": "192x192" }]
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/screenshot-mobile.png",
+      "sizes": "390x844",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "HiPo AI coaching interface on mobile"
+    }
+  ]
+}
