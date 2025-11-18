@@ -1,0 +1,433 @@
+/**
+ * Enhanced Chat Routes with Streaming Support
+ * 
+ * This file provides an enhanced version of chat routes with:
+ * - Server-Sent Events (SSE) for real-time AI response streaming
+ * - Better error handling and retry logic
+ * - Rate limiting
+ * - Message validation
+ * 
+ * To use: Replace chat.ts with this file or merge the streaming endpoint
+ */
+
+import express from 'express';
+import { db } from '../db/index.js';
+import { conversations, messages, users, userProfiles } from '../db/schema.js';
+import { eq, desc, and, isNull, lt } from 'drizzle-orm';
+import { authenticateToken, AuthRequest } from '../middleware/auth.js';
+import { aiService } from '../services/ai.service.js';
+
+const router = express.Router();
+
+// Rate limiting map (in-memory, use Redis in production)
+const rateLimitMap = new Map<number, { count: number; resetAt: number }>();
+
+function checkRateLimit(userId: number, maxRequests: number = 20, windowMs: number = 60000): boolean {
+  const now = Date.now();
+  const userLimit = rateLimitMap.get(userId);
+
+  if (!userLimit || now > userLimit.resetAt) {
+    rateLimitMap.set(userId, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+
+  if (userLimit.count >= maxRequests) {
+    return false;
+  }
+
+  userLimit.count++;
+  return true;
+}
+
+// Create new conversation
+router.post('/conversations', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const { title } = req.body;
+
+    // Validate title
+    if (title && title.length > 255) {
+      return res.status(400).json({ error: 'Title too long (max 255 characters)' });
+    }
+
+    const [conversation] = await db.insert(conversations).values({
+      userId: req.userId!,
+      title: title || 'New Conversation',
+    }).returning();
+
+    console.log(`[Chat] Created conversation ${conversation.id} for user ${req.userId}`);
+    res.status(201).json({ conversation });
+  } catch (error) {
+    console.error('[Chat] Create conversation error:', error);
+    res.status(500).json({ error: 'Failed to create conversation' });
+  }
+});
+
+// Get user conversations with pagination
+router.get('/conversations', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const offset = parseInt(req.query.offset as string) || 0;
+
+    const userConversations = await db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.userId, req.userId!),
+          isNull(conversations.deletedAt)
+        )
+      )
+      .orderBy(desc(conversations.updatedAt))
+      .limit(limit)
+      .offset(offset);
+
+    // Get total count
+    const totalResult = await db
+      .select({ count: conversations.id })
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.userId, req.userId!),
+          isNull(conversations.deletedAt)
+        )
+      );
+
+    res.json({
+      conversations: userConversations,
+      pagination: {
+        total: totalResult.length,
+        limit,
+        offset,
+        hasMore: userConversations.length === limit
+      }
+    });
+  } catch (error) {
+    console.error('[Chat] Get conversations error:', error);
+    res.status(500).json({ error: 'Failed to fetch conversations' });
+  }
+});
+
+// Get conversation messages with pagination
+router.get('/conversations/:id/messages', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const conversationId = parseInt(req.params.id);
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 100);
+    const before = req.query.before ? parseInt(req.query.before as string) : undefined;
+
+    // Verify conversation belongs to user
+    const [conversation] = await db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.id, conversationId),
+          isNull(conversations.deletedAt)
+        )
+      )
+      .limit(1);
+
+    if (!conversation || conversation.userId !== req.userId) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    // Get messages with pagination
+    const whereConditions = [eq(messages.conversationId, conversationId)];
+    if (before) {
+      whereConditions.push(lt(messages.id, before));
+    }
+
+    const conversationMessages = await db
+      .select()
+      .from(messages)
+      .where(and(...whereConditions))
+      .orderBy(desc(messages.id))
+      .limit(limit + 1);
+    const hasMore = conversationMessages.length > limit;
+    const messagesToReturn = hasMore ? conversationMessages.slice(0, -1) : conversationMessages;
+
+    res.json({
+      messages: messagesToReturn.reverse(), // Chronological order
+      pagination: {
+        hasMore,
+        before: hasMore ? messagesToReturn[0].id : null
+      }
+    });
+  } catch (error) {
+    console.error('[Chat] Get messages error:', error);
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// Send message with streaming AI response
+router.post('/conversations/:id/messages/stream', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const conversationId = parseInt(req.params.id);
+    const { content } = req.body;
+
+    // Validate input
+    if (!content || typeof content !== 'string') {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+
+    if (content.length > 5000) {
+      return res.status(400).json({ error: 'Message too long (max 5000 characters)' });
+    }
+
+    // Rate limiting
+    if (!checkRateLimit(req.userId!, 20, 60000)) {
+      return res.status(429).json({ error: 'Too many requests. Please wait a moment.' });
+    }
+
+    // Verify conversation belongs to user
+    const [conversation] = await db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.id, conversationId),
+          isNull(conversations.deletedAt)
+        )
+      )
+      .limit(1);
+
+    if (!conversation || conversation.userId !== req.userId) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    // Save user message
+    const [userMessage] = await db.insert(messages).values({
+      conversationId,
+      role: 'user',
+      content: content.trim(),
+    }).returning();
+
+    // Set up SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    // Send user message confirmation
+    res.write(`data: ${JSON.stringify({ type: 'user_message', message: userMessage })}\n\n`);
+
+    // Get user context
+    const [user] = await db.select().from(users).where(eq(users.id, req.userId!)).limit(1);
+    const [profile] = await db.select().from(userProfiles).where(eq(userProfiles.userId, req.userId!)).limit(1);
+
+    // Get conversation history
+    const history = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId))
+      .orderBy(messages.createdAt)
+      .limit(20);
+
+    // Generate AI response
+    const chatHistory = history.map(msg => ({
+      role: msg.role as 'user' | 'assistant',
+      content: msg.content,
+    }));
+
+    try {
+      const aiResponse = await aiService.chat(chatHistory, {
+        name: user.name || undefined,
+        roleTitle: profile?.roleTitle || undefined,
+        experienceYears: profile?.experienceYears || undefined,
+        careerGoals: profile?.careerGoals || undefined,
+        currentChallenges: profile?.currentChallenges || undefined,
+        managerTone: profile?.managerTone || undefined,
+      });
+
+      // Save AI message
+      const [assistantMessage] = await db.insert(messages).values({
+        conversationId,
+        role: 'assistant',
+        content: aiResponse,
+      }).returning();
+
+      // Update conversation timestamp
+      await db
+        .update(conversations)
+        .set({ updatedAt: new Date() })
+        .where(eq(conversations.id, conversationId));
+
+      // Send AI response
+      res.write(`data: ${JSON.stringify({ type: 'assistant_message', message: assistantMessage })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+      res.end();
+
+      console.log(`[Chat] Message sent in conversation ${conversationId}`);
+    } catch (aiError) {
+      console.error('[Chat] AI generation error:', aiError);
+      res.write(`data: ${JSON.stringify({ type: 'error', error: 'Failed to generate response' })}\n\n`);
+      res.end();
+    }
+  } catch (error) {
+    console.error('[Chat] Send message error:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to send message' });
+    } else {
+      res.write(`data: ${JSON.stringify({ type: 'error', error: 'Internal server error' })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+// Send message (non-streaming, backward compatible)
+router.post('/conversations/:id/messages', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const conversationId = parseInt(req.params.id);
+    const { content } = req.body;
+
+    // Validate input
+    if (!content || typeof content !== 'string') {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+
+    if (content.length > 5000) {
+      return res.status(400).json({ error: 'Message too long (max 5000 characters)' });
+    }
+
+    // Rate limiting
+    if (!checkRateLimit(req.userId!, 20, 60000)) {
+      return res.status(429).json({ error: 'Too many requests. Please wait a moment.' });
+    }
+
+    // Verify conversation belongs to user
+    const [conversation] = await db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.id, conversationId),
+          isNull(conversations.deletedAt)
+        )
+      )
+      .limit(1);
+
+    if (!conversation || conversation.userId !== req.userId) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    // Save user message
+    const [userMessage] = await db.insert(messages).values({
+      conversationId,
+      role: 'user',
+      content: content.trim(),
+    }).returning();
+
+    // Get user context
+    const [user] = await db.select().from(users).where(eq(users.id, req.userId!)).limit(1);
+    const [profile] = await db.select().from(userProfiles).where(eq(userProfiles.userId, req.userId!)).limit(1);
+
+    // Get conversation history
+    const history = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId))
+      .orderBy(messages.createdAt)
+      .limit(20);
+
+    // Generate AI response
+    const chatHistory = history.map(msg => ({
+      role: msg.role as 'user' | 'assistant',
+      content: msg.content,
+    }));
+
+    const aiResponse = await aiService.chat(chatHistory, {
+      name: user.name || undefined,
+      roleTitle: profile?.roleTitle || undefined,
+      experienceYears: profile?.experienceYears || undefined,
+      careerGoals: profile?.careerGoals || undefined,
+      currentChallenges: profile?.currentChallenges || undefined,
+      managerTone: profile?.managerTone || undefined,
+    });
+
+    // Save AI message
+    const [assistantMessage] = await db.insert(messages).values({
+      conversationId,
+      role: 'assistant',
+      content: aiResponse,
+    }).returning();
+
+    // Update conversation timestamp
+    await db
+      .update(conversations)
+      .set({ updatedAt: new Date() })
+      .where(eq(conversations.id, conversationId));
+
+    console.log(`[Chat] Message sent in conversation ${conversationId}`);
+
+    res.json({
+      userMessage,
+      assistantMessage,
+    });
+  } catch (error) {
+    console.error('[Chat] Send message error:', error);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+// Delete conversation (soft delete)
+router.delete('/conversations/:id', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const conversationId = parseInt(req.params.id);
+
+    // Verify conversation belongs to user
+    const [conversation] = await db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.id, conversationId),
+          isNull(conversations.deletedAt)
+        )
+      )
+      .limit(1);
+
+    if (!conversation || conversation.userId !== req.userId) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    // Soft delete conversation
+    await db
+      .update(conversations)
+      .set({ deletedAt: new Date() })
+      .where(eq(conversations.id, conversationId));
+
+    console.log(`[Chat] Deleted conversation ${conversationId}`);
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[Chat] Delete conversation error:', error);
+    res.status(500).json({ error: 'Failed to delete conversation' });
+  }
+});
+
+// Get conversation statistics
+router.get('/stats', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const stats = await db
+      .select({
+        totalConversations: conversations.id,
+        totalMessages: messages.id
+      })
+      .from(conversations)
+      .leftJoin(messages, eq(messages.conversationId, conversations.id))
+      .where(
+        and(
+          eq(conversations.userId, req.userId!),
+          isNull(conversations.deletedAt)
+        )
+      );
+
+    res.json({
+      totalConversations: stats.length,
+      totalMessages: stats.filter(s => s.totalMessages).length
+    });
+  } catch (error) {
+    console.error('[Chat] Get stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch statistics' });
+  }
+});
+
+export default router;

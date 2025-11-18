@@ -1,0 +1,351 @@
+import express from 'express';
+import { db } from '../db/index.js';
+import { conversations, messages, users, userProfiles } from '../db/schema.js';
+import { eq, desc, and, gt, lt, isNull, sql } from 'drizzle-orm';
+import { authenticateToken, AuthRequest } from '../middleware/auth.js';
+import { aiService } from '../services/ai.service.js';
+import { cacheService } from '../services/cache.service.js';
+
+const router = express.Router();
+
+// ============================================
+// PAGINATION HELPERS
+// ============================================
+
+interface PaginationParams {
+  limit?: number;
+  cursor?: number;
+  direction?: 'forward' | 'backward';
+}
+
+const DEFAULT_PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 100;
+
+function parsePaginationParams(query: any): PaginationParams {
+  return {
+    limit: Math.min(parseInt(query.limit) || DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
+    cursor: query.cursor ? parseInt(query.cursor) : undefined,
+    direction: query.direction === 'backward' ? 'backward' : 'forward'
+  };
+}
+
+// ============================================
+// OPTIMIZED ENDPOINTS
+// ============================================
+
+// Get user conversations with pagination
+router.get('/conversations', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const { limit, cursor } = parsePaginationParams(req.query);
+    const includeArchived = req.query.include_archived === 'true';
+    
+    // Try cache first
+    const cacheKey = `conversations:${req.userId}:${cursor || 'first'}:${includeArchived}`;
+    const cached = await cacheService.get(cacheKey);
+    
+    if (cached) {
+      return res.json(JSON.parse(cached));
+    }
+
+    // Build query
+    let query = db
+      .select({
+        id: conversations.id,
+        userId: conversations.userId,
+        title: conversations.title,
+        messageCount: conversations.messageCount,
+        lastMessageAt: conversations.lastMessageAt,
+        createdAt: conversations.createdAt,
+        updatedAt: conversations.updatedAt,
+        archivedAt: conversations.archivedAt
+      })
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.userId, req.userId!),
+          isNull(conversations.deletedAt),
+          includeArchived ? undefined : isNull(conversations.archivedAt)
+        )
+      )
+      .orderBy(desc(conversations.updatedAt))
+      .$dynamic();
+
+    // Apply cursor pagination
+    if (cursor) {
+      query = query.where(lt(conversations.id, cursor));
+    }
+
+    const results = await query.limit(limit! + 1);
+    
+    // Check if there are more results
+    const hasMore = results.length > limit!;
+    const conversationList = hasMore ? results.slice(0, -1) : results;
+    const nextCursor = hasMore ? conversationList[conversationList.length - 1].id : null;
+
+    const response = {
+      conversations: conversationList,
+      pagination: {
+        nextCursor,
+        hasMore,
+        limit: limit!
+      }
+    };
+
+    // Cache for 5 minutes
+    await cacheService.set(cacheKey, JSON.stringify(response), 300);
+
+    res.json(response);
+  } catch (error) {
+    console.error('Get conversations error:', error);
+    res.status(500).json({ error: 'Failed to fetch conversations' });
+  }
+});
+
+// Get conversation messages with pagination
+router.get('/conversations/:id/messages', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const conversationId = parseInt(req.params.id);
+    const { limit, cursor, direction } = parsePaginationParams(req.query);
+
+    // Verify conversation belongs to user (cached)
+    const cacheKey = `conversation:${conversationId}:owner`;
+    let conversation: any = await cacheService.get(cacheKey);
+    
+    if (!conversation) {
+      [conversation] = await db
+        .select()
+        .from(conversations)
+        .where(
+          and(
+            eq(conversations.id, conversationId),
+            isNull(conversations.deletedAt)
+          )
+        )
+        .limit(1);
+      
+      if (conversation) {
+        await cacheService.set(cacheKey, JSON.stringify(conversation), 3600);
+      }
+    } else {
+      conversation = JSON.parse(conversation);
+    }
+
+    if (!conversation || conversation.userId !== req.userId) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    // Try cache for messages
+    const messagesCacheKey = `messages:${conversationId}:${cursor || 'latest'}:${direction}`;
+    const cachedMessages = await cacheService.get(messagesCacheKey);
+    
+    if (cachedMessages) {
+      return res.json(JSON.parse(cachedMessages));
+    }
+
+    // Build query with cursor pagination
+    let query = db
+      .select()
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId))
+      .$dynamic();
+
+    if (cursor) {
+      if (direction === 'backward') {
+        query = query.where(lt(messages.id, cursor)).orderBy(desc(messages.id));
+      } else {
+        query = query.where(gt(messages.id, cursor)).orderBy(messages.id);
+      }
+    } else {
+      // Default: get latest messages
+      query = query.orderBy(desc(messages.id));
+    }
+
+    const results = await query.limit(limit! + 1);
+    
+    // Check if there are more results
+    const hasMore = results.length > limit!;
+    const messageList = hasMore ? results.slice(0, -1) : results;
+    
+    // Reverse if getting latest (desc order)
+    if (!cursor || direction === 'forward') {
+      messageList.reverse();
+    }
+
+    const nextCursor = hasMore ? messageList[messageList.length - 1].id : null;
+    const prevCursor = messageList.length > 0 ? messageList[0].id : null;
+
+    const response = {
+      messages: messageList,
+      pagination: {
+        nextCursor,
+        prevCursor,
+        hasMore,
+        limit: limit!
+      }
+    };
+
+    // Cache for 2 minutes (shorter TTL for active conversations)
+    await cacheService.set(messagesCacheKey, JSON.stringify(response), 120);
+
+    res.json(response);
+  } catch (error) {
+    console.error('Get messages error:', error);
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// Send message and get AI response (optimized)
+router.post('/conversations/:id/messages', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const conversationId = parseInt(req.params.id);
+    const { content } = req.body;
+
+    if (!content) {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+
+    // Verify conversation belongs to user
+    const [conversation] = await db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.id, conversationId),
+          isNull(conversations.deletedAt)
+        )
+      )
+      .limit(1);
+
+    if (!conversation || conversation.userId !== req.userId) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    // Save user message
+    const [userMessage] = await db.insert(messages).values({
+      conversationId,
+      role: 'user',
+      content,
+    }).returning();
+
+    // Get user context (cached)
+    const userCacheKey = `user:${req.userId}:profile`;
+    let userContext: any = await cacheService.get(userCacheKey);
+    
+    if (!userContext) {
+      const [user] = await db.select().from(users).where(eq(users.id, req.userId!)).limit(1);
+      const [profile] = await db.select().from(userProfiles).where(eq(userProfiles.userId, req.userId!)).limit(1);
+      userContext = { user, profile };
+      await cacheService.set(userCacheKey, JSON.stringify(userContext), 1800);
+    } else {
+      userContext = JSON.parse(userContext);
+    }
+
+    // Get recent conversation history (last 20 messages for context)
+    const history = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.conversationId, conversationId))
+      .orderBy(desc(messages.id))
+      .limit(20);
+
+    history.reverse(); // Chronological order
+
+    // Generate AI response
+    const chatHistory = history.map(msg => ({
+      role: msg.role as 'user' | 'assistant',
+      content: msg.content,
+    }));
+
+    const { user, profile } = userContext;
+    const aiResponse = await aiService.chat(chatHistory, {
+      name: user.name || undefined,
+      roleTitle: profile?.roleTitle || undefined,
+      experienceYears: profile?.experienceYears || undefined,
+      careerGoals: profile?.careerGoals || undefined,
+      currentChallenges: profile?.currentChallenges || undefined,
+      managerTone: profile?.managerTone || undefined,
+    });
+
+    // Save AI message
+    const [assistantMessage] = await db.insert(messages).values({
+      conversationId,
+      role: 'assistant',
+      content: aiResponse,
+    }).returning();
+
+    // Invalidate caches
+    await cacheService.invalidatePattern(`messages:${conversationId}:*`);
+    await cacheService.invalidatePattern(`conversations:${req.userId}:*`);
+
+    res.json({
+      userMessage,
+      assistantMessage,
+    });
+  } catch (error) {
+    console.error('Send message error:', error);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+// Soft delete conversation
+router.delete('/conversations/:id', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const conversationId = parseInt(req.params.id);
+
+    // Verify conversation belongs to user
+    const [conversation] = await db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.id, conversationId),
+          isNull(conversations.deletedAt)
+        )
+      )
+      .limit(1);
+
+    if (!conversation || conversation.userId !== req.userId) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+
+    // Soft delete (set deleted_at timestamp)
+    await db
+      .update(conversations)
+      .set({ deletedAt: new Date() })
+      .where(eq(conversations.id, conversationId));
+
+    // Invalidate caches
+    await cacheService.invalidatePattern(`conversation:${conversationId}:*`);
+    await cacheService.invalidatePattern(`messages:${conversationId}:*`);
+    await cacheService.invalidatePattern(`conversations:${req.userId}:*`);
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete conversation error:', error);
+    res.status(500).json({ error: 'Failed to delete conversation' });
+  }
+});
+
+// Get conversation statistics (for monitoring)
+router.get('/stats', authenticateToken, async (req: AuthRequest, res) => {
+  try {
+    const stats = await db.execute(sql`
+      SELECT 
+        COUNT(*) as total_conversations,
+        COUNT(*) FILTER (WHERE archived_at IS NULL) as active_conversations,
+        COUNT(*) FILTER (WHERE archived_at IS NOT NULL) as archived_conversations,
+        SUM(message_count) as total_messages,
+        AVG(message_count) as avg_messages_per_conversation
+      FROM conversations
+      WHERE user_id = ${req.userId}
+        AND deleted_at IS NULL
+    `);
+
+    res.json({ stats: stats.rows[0] });
+  } catch (error) {
+    console.error('Get stats error:', error);
+    res.status(500).json({ error: 'Failed to fetch statistics' });
+  }
+});
+
+export default router;

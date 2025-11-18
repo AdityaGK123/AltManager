@@ -1,0 +1,14 @@
+<svg width="800" height="600" viewBox="0 0 800 600" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Royal Blue sections -->
+  <path d="M0 0 C0 206.5 0 370 0 370 L352 370 L352 0 Z" fill="#4C62E3"/>
+  <path d="M352 370 L532 370 L532 600 L352 600 Z" fill="#4C62E3"/>
+  
+  <!-- Coral sections -->
+  <path d="M352 0 C552 0 745 0 745 0 C745 200 745 370 745 370 L532 370 L532 158 L408 158 C408 158 408 230 460 258 C460 258 408 258 408 258 L408 370 L352 370 Z" fill="#EE7D79"/>
+  
+  <!-- White sections -->
+  <path d="M352 158 L532 158 L532 370 L352 370 Z" fill="#FFFFFF"/>
+  
+  <!-- Blue accent in white section -->
+  <path d="M408 230 C408 230 460 230 460 258 C460 258 408 258 408 258 Z" fill="#4C62E3"/>
+</svg>

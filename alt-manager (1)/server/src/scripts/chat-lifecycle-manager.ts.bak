@@ -1,0 +1,310 @@
+/**
+ * Chat Data Lifecycle Manager
+ * 
+ * Handles archival and deletion of old chat data based on retention policies.
+ * Run as cron job: 0 2 * * * (daily at 2 AM)
+ */
+
+import { db } from '../db/index.js';
+import { conversations, messages } from '../db/schema.js';
+import { and, lt, isNull, isNotNull, sql } from 'drizzle-orm';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+// ============================================
+// CONFIGURATION
+// ============================================
+
+const RETENTION_POLICY = {
+  ARCHIVE_AFTER_DAYS: 180,    // 6 months
+  DELETE_AFTER_DAYS: 365,     // 12 months
+  BATCH_SIZE: 1000,           // Process in batches to avoid memory issues
+  DRY_RUN: process.env.LIFECYCLE_DRY_RUN === 'true' // Set to true for testing
+};
+
+// ============================================
+// LIFECYCLE MANAGER
+// ============================================
+
+class ChatLifecycleManager {
+  private stats = {
+    conversationsArchived: 0,
+    conversationsDeleted: 0,
+    messagesArchived: 0,
+    messagesDeleted: 0,
+    errors: 0
+  };
+
+  /**
+   * Main execution function
+   */
+  async run() {
+    console.log('🚀 Starting Chat Lifecycle Manager');
+    console.log(`   Mode: ${RETENTION_POLICY.DRY_RUN ? 'DRY RUN' : 'PRODUCTION'}`);
+    console.log(`   Archive after: ${RETENTION_POLICY.ARCHIVE_AFTER_DAYS} days`);
+    console.log(`   Delete after: ${RETENTION_POLICY.DELETE_AFTER_DAYS} days\n`);
+
+    try {
+      // Step 1: Archive old conversations
+      await this.archiveOldConversations();
+
+      // Step 2: Delete very old conversations
+      await this.deleteOldConversations();
+
+      // Step 3: Archive old messages
+      await this.archiveOldMessages();
+
+      // Step 4: Cleanup orphaned messages
+      await this.cleanupOrphanedMessages();
+
+      // Step 5: Vacuum and analyze
+      if (!RETENTION_POLICY.DRY_RUN) {
+        await this.optimizeDatabase();
+      }
+
+      // Report results
+      this.printReport();
+
+    } catch (error) {
+      console.error('❌ Lifecycle manager failed:', error);
+      this.stats.errors++;
+    }
+  }
+
+  /**
+   * Archive conversations older than ARCHIVE_AFTER_DAYS
+   */
+  private async archiveOldConversations() {
+    console.log('📦 Archiving old conversations...');
+
+    const archiveDate = new Date();
+    archiveDate.setDate(archiveDate.getDate() - RETENTION_POLICY.ARCHIVE_AFTER_DAYS);
+
+    try {
+      if (RETENTION_POLICY.DRY_RUN) {
+        // Count what would be archived
+        const result = await db.execute(sql`
+          SELECT COUNT(*) as count
+          FROM conversations
+          WHERE updated_at < ${archiveDate}
+            AND archived_at IS NULL
+            AND deleted_at IS NULL
+        `);
+        this.stats.conversationsArchived = parseInt(String(result.rows[0].count));
+        console.log(`   Would archive: ${this.stats.conversationsArchived} conversations`);
+      } else {
+        // Actually archive
+        const result = await db
+          .update(conversations)
+          .set({ archivedAt: new Date() })
+          .where(
+            and(
+              lt(conversations.updatedAt, archiveDate),
+              isNull(conversations.archivedAt),
+              isNull(conversations.deletedAt)
+            )
+          )
+          .returning({ id: conversations.id });
+
+        this.stats.conversationsArchived = result.length;
+        console.log(`   ✅ Archived: ${this.stats.conversationsArchived} conversations`);
+      }
+    } catch (error) {
+      console.error('   ❌ Archive failed:', error);
+      this.stats.errors++;
+    }
+  }
+
+  /**
+   * Soft delete conversations older than DELETE_AFTER_DAYS
+   */
+  private async deleteOldConversations() {
+    console.log('🗑️  Deleting old conversations...');
+
+    const deleteDate = new Date();
+    deleteDate.setDate(deleteDate.getDate() - RETENTION_POLICY.DELETE_AFTER_DAYS);
+
+    try {
+      if (RETENTION_POLICY.DRY_RUN) {
+        const result = await db.execute(sql`
+          SELECT COUNT(*) as count
+          FROM conversations
+          WHERE created_at < ${deleteDate}
+            AND deleted_at IS NULL
+        `);
+        this.stats.conversationsDeleted = parseInt(String(result.rows[0].count));
+        console.log(`   Would delete: ${this.stats.conversationsDeleted} conversations`);
+      } else {
+        const result = await db
+          .update(conversations)
+          .set({ deletedAt: new Date() })
+          .where(
+            and(
+              lt(conversations.createdAt, deleteDate),
+              isNull(conversations.deletedAt)
+            )
+          )
+          .returning({ id: conversations.id });
+
+        this.stats.conversationsDeleted = result.length;
+        console.log(`   ✅ Deleted: ${this.stats.conversationsDeleted} conversations`);
+      }
+    } catch (error) {
+      console.error('   ❌ Delete failed:', error);
+      this.stats.errors++;
+    }
+  }
+
+  /**
+   * Archive messages from archived conversations
+   */
+  private async archiveOldMessages() {
+    console.log('📦 Archiving old messages...');
+
+    try {
+      if (RETENTION_POLICY.DRY_RUN) {
+        const result = await db.execute(sql`
+          SELECT COUNT(*) as count
+          FROM messages m
+          INNER JOIN conversations c ON m.conversation_id = c.id
+          WHERE c.archived_at IS NOT NULL
+            AND m.archived_at IS NULL
+        `);
+        this.stats.messagesArchived = parseInt(String(result.rows[0].count));
+        console.log(`   Would archive: ${this.stats.messagesArchived} messages`);
+      } else {
+        // Archive in batches
+        let totalArchived = 0;
+        let hasMore = true;
+
+        while (hasMore) {
+          const result = await db.execute(sql`
+            UPDATE messages
+            SET archived_at = NOW()
+            WHERE id IN (
+              SELECT m.id
+              FROM messages m
+              INNER JOIN conversations c ON m.conversation_id = c.id
+              WHERE c.archived_at IS NOT NULL
+                AND m.archived_at IS NULL
+              LIMIT ${RETENTION_POLICY.BATCH_SIZE}
+            )
+            RETURNING id
+          `);
+
+          const batchSize = result.rows.length;
+          totalArchived += batchSize;
+          hasMore = batchSize === RETENTION_POLICY.BATCH_SIZE;
+
+          if (batchSize > 0) {
+            console.log(`   Archived batch: ${batchSize} messages (total: ${totalArchived})`);
+          }
+        }
+
+        this.stats.messagesArchived = totalArchived;
+        console.log(`   ✅ Archived: ${totalArchived} messages`);
+      }
+    } catch (error) {
+      console.error('   ❌ Archive messages failed:', error);
+      this.stats.errors++;
+    }
+  }
+
+  /**
+   * Delete messages from deleted conversations
+   */
+  private async cleanupOrphanedMessages() {
+    console.log('🧹 Cleaning up orphaned messages...');
+
+    try {
+      if (RETENTION_POLICY.DRY_RUN) {
+        const result = await db.execute(sql`
+          SELECT COUNT(*) as count
+          FROM messages m
+          INNER JOIN conversations c ON m.conversation_id = c.id
+          WHERE c.deleted_at IS NOT NULL
+        `);
+        this.stats.messagesDeleted = parseInt(String(result.rows[0].count));
+        console.log(`   Would delete: ${this.stats.messagesDeleted} messages`);
+      } else {
+        // Delete in batches
+        let totalDeleted = 0;
+        let hasMore = true;
+
+        while (hasMore) {
+          const result = await db.execute(sql`
+            DELETE FROM messages
+            WHERE id IN (
+              SELECT m.id
+              FROM messages m
+              INNER JOIN conversations c ON m.conversation_id = c.id
+              WHERE c.deleted_at IS NOT NULL
+              LIMIT ${RETENTION_POLICY.BATCH_SIZE}
+            )
+            RETURNING id
+          `);
+
+          const batchSize = result.rows.length;
+          totalDeleted += batchSize;
+          hasMore = batchSize === RETENTION_POLICY.BATCH_SIZE;
+
+          if (batchSize > 0) {
+            console.log(`   Deleted batch: ${batchSize} messages (total: ${totalDeleted})`);
+          }
+        }
+
+        this.stats.messagesDeleted = totalDeleted;
+        console.log(`   ✅ Deleted: ${totalDeleted} messages`);
+      }
+    } catch (error) {
+      console.error('   ❌ Cleanup failed:', error);
+      this.stats.errors++;
+    }
+  }
+
+  /**
+   * Optimize database after cleanup
+   */
+  private async optimizeDatabase() {
+    console.log('⚡ Optimizing database...');
+
+    try {
+      // Vacuum to reclaim space
+      await db.execute(sql`VACUUM ANALYZE conversations`);
+      await db.execute(sql`VACUUM ANALYZE messages`);
+      console.log('   ✅ Database optimized');
+    } catch (error) {
+      console.error('   ⚠️  Optimization failed (non-critical):', error);
+    }
+  }
+
+  /**
+   * Print summary report
+   */
+  private printReport() {
+    console.log('\n📊 Lifecycle Manager Report');
+    console.log('================================');
+    console.log(`Conversations archived: ${this.stats.conversationsArchived}`);
+    console.log(`Conversations deleted:  ${this.stats.conversationsDeleted}`);
+    console.log(`Messages archived:      ${this.stats.messagesArchived}`);
+    console.log(`Messages deleted:       ${this.stats.messagesDeleted}`);
+    console.log(`Errors:                 ${this.stats.errors}`);
+    console.log('================================\n');
+
+    if (this.stats.errors > 0) {
+      console.log('⚠️  Completed with errors');
+      process.exit(1);
+    } else {
+      console.log('✅ Completed successfully');
+      process.exit(0);
+    }
+  }
+}
+
+// ============================================
+// EXECUTION
+// ============================================
+
+const manager = new ChatLifecycleManager();
+manager.run();
